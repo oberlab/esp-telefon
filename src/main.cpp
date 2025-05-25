@@ -4,36 +4,58 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <HTTPClient.h>
 
 String wifiSSID;
 String wifiPassword;
 
+// ***** Configurable URLs and number mappings *****
+String urlBellOn;
+String urlBellOff;
+String urlOffHook;
+String urlOnHook;
+String urlOnDialed;
+String urlUnknownNumber;
+String urlBlackButton;
+String mapKey[6];       // 1-based: configured dial strings
+String mapURL[6];       // corresponding URLs
+
 // ***** Pin-Konfiguration *****
-// Für die Klingel (L298N)
 const int in1Pin_h_bridge = 32;   // IN1 des L298N
 const int in2Pin_h_bridge = 33;   // IN2 des L298N
-// Wählscheibe
-const int dialPin  = 12;   // Eingang für die Wählscheibe (mit internem Pullup, idle HIGH)
-// Weitere Eingänge:
-const int schwarzeTastePin = 14; // "Schwarze Taste" (active LOW) – dient hier auch als "Config-Taste" beim Powerup
-const int gabelPin         = 27; // "Gabel" – normally closed (Logik wird invertiert)
-const int resetPin         = 25; // "Reset" – dient hier als "Config-Taste" beim Powerup
+const int dialPin          = 12;  // Wählscheibe Eingang (mit internem Pullup)
+const int schwarzeTastePin = 14;  // "Schwarze Taste" (active LOW)
+const int gabelPin         = 27;  // "Gabel" – normally closed (invertierte Logik)
+const int resetPin         = 25;  // "Reset" – Config-Taste beim Powerup
 
 // ***** Variablen für Wählscheibe & Klingel *****
 volatile int pulseCount = 0;              // Zählt Impulse der Wählscheibe
 volatile unsigned long lastPulseTime = 0; // Zeitpunkt des letzten Impulses
-String dialNumber = "";                   // Sammelt die gewählten Ziffern
+String dialNumber = "";                  // Sammelt gewählte Ziffern
+volatile bool klingelAktiv = false;       // Klingel-Modus steuern
+volatile bool klingel_not_paused = false;
+volatile bool url_after_lift = false;
+volatile bool url_after_hang_up = false;
+bool currentGabel = LOW;
 
-volatile bool klingelAktiv = false;       // Steuert den Klingelmodus
+#define GABEL_ABGENOMMEN HIGH
+#define GABEL_AUFGELEGT LOW
 
 // ***** WiFi, Webserver & WebSocket *****
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// ***** HTML-Weboberfläche für Telefoninterface *****
-// Hier wurden die Anzeige der gewählten Nummer als History integriert.
-// Die "Dial Number"-Anzeige wurde entfernt und stattdessen wird unter dem Klingel-Button eine History (max. 10 Einträge)
-// angezeigt. Jeder Eintrag zeigt an, wie lange das Wählen her ist.
+// Helper: HTTP GET ausführen
+void sendURL(const String &url) {
+  if (url.length() > 0) {
+    HTTPClient http;
+    http.begin(url);
+    http.GET();
+    http.end();
+  }
+}
+
+// ***** HTML-Weboberfläche für Telefoninterface mit Konfigurationsmenü *****
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -42,15 +64,23 @@ const char index_html[] PROGMEM = R"rawliteral(
   <title>ESP32 Telefon Interface</title>
   <style>
     body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 0; }
-    .container { max-width: 600px; margin: 50px auto; background: #fff; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+    .container { max-width: 600px; margin: 50px auto; background: #fff; padding: 20px;
+                 box-shadow: 0 0 10px rgba(0,0,0,0.1); }
     h1 { text-align: center; color: #333; }
     .status { margin: 10px 0; padding: 10px; background: #e0e0e0; border-radius: 5px; }
-    .button { display: block; width: 100%; padding: 10px; background: #007BFF; color: #fff; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 20px; }
+    .button { display: block; width: 100%; padding: 10px; background: #007BFF;
+              color: #fff; border: none; border-radius: 5px; cursor: pointer;
+              font-size: 16px; margin-top: 20px; }
     .button:hover { background: #0056b3; }
     #dialHistory { margin-top: 20px; }
-    #dialHistory h2 { margin: 0 0 10px 0; }
-    #historyList { list-style-type: none; padding: 0; margin: 0; }
+    #historyList { list-style: none; padding: 0; margin: 0; }
     #historyList li { padding: 5px; border-bottom: 1px solid #ccc; }
+    details { margin-top: 20px; padding: 10px; background: #fafafa;
+               border: 1px solid #ccc; border-radius: 5px; }
+    summary { font-weight: bold; cursor: pointer; }
+    label { display: block; margin-top: 8px; }
+    input[type="text"] { width: 100%; padding: 6px; margin-top: 2px; }
+    input[type="submit"] { margin-top: 12px; padding: 8px 16px; }
   </style>
 </head>
 <body>
@@ -64,39 +94,46 @@ const char index_html[] PROGMEM = R"rawliteral(
       <h2>Dial History</h2>
       <ul id="historyList"></ul>
     </div>
+    <details>
+      <summary>Konfiguration</summary>
+      <form method="POST" action="/saveConfig">
+        <label>URL Klingel aktivieren:</label>
+        <input type="text" name="urlBellOn" value="%URL_BELL_ON%">
+        <label>URL Klingel deaktivieren:</label>
+        <input type="text" name="urlBellOff" value="%URL_BELL_OFF%">
+        <label>URL Hörer abgehoben:</label>
+        <input type="text" name="urlOffHook" value="%URL_OFF_HOOK%">
+        <label>URL Hörer aufgelegt:</label>
+        <input type="text" name="urlOnHook" value="%URL_ON_HOOK%">
+        <label>URL gewählt:</label>
+        <input type="text" name="urlOnDialed" value="%URL_ON_DIALED%">
+        <label>URL unbekannte Nummer:</label>
+        <input type="text" name="urlUnknownNumber" value="%URL_UNKNOWN%">
+        <label>URL Schwarze Taste:</label>
+        <input type="text" name="urlBlackButton" value="%URL_BLACK%">
+        <h3>Nummer-Mappings</h3>
+        %NUM_CONFIG_FIELDS%
+        <input type="submit" value="Speichern">
+      </form>
+    </details>
   </div>
   <script>
     var gateway = `ws://${window.location.hostname}/ws`;
     var websocket;
-    var historyList = []; // Array zur Speicherung der History-Einträge (max. 10 Einträge)
+    var historyList = [];
 
     function initWebSocket() {
-      console.log('Connecting to WebSocket...');
       websocket = new WebSocket(gateway);
-      websocket.onopen = function(event) { 
-         console.log('WebSocket connected'); 
-      };
-      websocket.onclose = function(event) {
-        console.log('WebSocket disconnected, retrying in 2 seconds...');
-        setTimeout(initWebSocket, 2000);
-      };
+      websocket.onopen = function() { console.log('WebSocket connected'); };
+      websocket.onclose = function() { console.log('WebSocket disconnected'); setTimeout(initWebSocket, 2000); };
       websocket.onmessage = function(event) {
         var data = JSON.parse(event.data);
-        document.getElementById("schwarzeTaste").innerText = data.schwarzeTaste ? "Pressed" : "Released";
-        document.getElementById("gabel").innerText = data.gabel ? "Pressed" : "Released";
+        document.getElementById("schwarzeTaste").innerText = data.schwarzeTaste ? "Gedrückt" : "Losgelassen";
+        document.getElementById("gabel").innerText = data.gabel ? "Abgehoben" : "Aufgelegt";
         document.getElementById("klingelAktiv").innerText = data.klingelAktiv ? "Active" : "Inactive";
-        // Wenn ein dialNumber empfangen wird, füge diesen Eintrag zur History hinzu
         if (data.dialNumber !== undefined) {
-          var entry = {
-            number: data.dialNumber,
-            timestamp: Date.now()
-          };
-          // Neuer Eintrag oben hinzufügen
-          historyList.unshift(entry);
-          // Falls mehr als 10 Einträge, entferne den ältesten
-          if (historyList.length > 10) {
-            historyList.pop();
-          }
+          historyList.unshift({ number: data.dialNumber, timestamp: Date.now() });
+          if (historyList.length > 10) historyList.pop();
           updateHistory();
         }
       };
@@ -108,21 +145,16 @@ const char index_html[] PROGMEM = R"rawliteral(
       historyList.forEach(function(entry) {
         var elapsed = Math.floor((Date.now() - entry.timestamp) / 1000);
         var li = document.createElement("li");
-        li.textContent = "Number: " + entry.number + " ( " + elapsed + " s ago )";
+        li.textContent = "Number: " + entry.number + " (" + elapsed + " s ago)";
         listEl.appendChild(li);
       });
     }
 
-    // Aktualisiere die History alle Sekunde, damit die "elapsed time" aktualisiert wird
     setInterval(updateHistory, 1000);
 
     function toggleBell() {
       var current = document.getElementById("klingelAktiv").innerText;
-      if (current === "Active") {
-        websocket.send('{"klingelAktiv": false}');
-      } else {
-        websocket.send('{"klingelAktiv": true}');
-      }
+      websocket.send(JSON.stringify({ klingelAktiv: current !== "Active" }));
     }
 
     window.addEventListener('load', initWebSocket, false);
@@ -131,7 +163,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// ***** HTML-Seite für WiFi-Konfiguration (AP-Modus) *****
 const char config_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -160,119 +191,9 @@ const char config_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// ***** Interrupt-Service-Routine für die Wählscheibe (Debounce 75ms) *****
-void IRAM_ATTR dialISR() {
-  static unsigned long lastDebounceTime = 0;
-  unsigned long now = millis();
-  if (now - lastDebounceTime > 75) {
-    pulseCount++;
-    lastPulseTime = now;
-    lastDebounceTime = now;
-  }
-}
 
-// ***** Hintergrundtask: Erzeugt 25-Hz-Signal durch alternierendes Schalten von in1 und in2 *****
-void pulseTask(void * parameter) {
-  for (;;) {
-    if (klingelAktiv) {
-      digitalWrite(in1Pin_h_bridge, HIGH);
-      digitalWrite(in2Pin_h_bridge, LOW);
-      vTaskDelay(pdMS_TO_TICKS(15));
 
-      digitalWrite(in2Pin_h_bridge, LOW);
-      digitalWrite(in1Pin_h_bridge, LOW);
-      vTaskDelay(pdMS_TO_TICKS(15));
-
-      digitalWrite(in2Pin_h_bridge, HIGH);
-      digitalWrite(in1Pin_h_bridge, LOW);
-      vTaskDelay(pdMS_TO_TICKS(15));
-
-      digitalWrite(in2Pin_h_bridge, LOW);
-      digitalWrite(in1Pin_h_bridge, LOW);
-      vTaskDelay(pdMS_TO_TICKS(15));
-    } else {
-      digitalWrite(in2Pin_h_bridge, LOW);
-      digitalWrite(in1Pin_h_bridge, LOW);
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
-  }
-}
-
-// ***** Task zur Auswertung der Wählscheibe *****
-// Nach ca. 1.7 Sekunden Inaktivität werden die gezählten Impulse zu einer Ziffer verarbeitet,
-// und die komplette Nummer wird per WebSocket versendet.
-void dialTask(void * parameter) {
-  for (;;) {
-    unsigned long now = millis();
-    if (pulseCount > 0 && (now - lastPulseTime > 200)) {
-      noInterrupts();
-      int count = pulseCount;
-      pulseCount = 0;
-      interrupts();
-      int digit = (count == 10) ? 0 : count;
-      dialNumber += String(digit);
-      Serial.print("Digit added: ");
-      Serial.println(digit);
-    }
-    if (pulseCount == 0 && dialNumber.length() > 0 && (now - lastPulseTime > 1700)) {
-      String json = "{ \"dialNumber\": \"" + dialNumber + "\" }";
-      ws.textAll(json);
-      Serial.print("Complete dial number sent: ");
-      Serial.println(dialNumber);
-      dialNumber = "";
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
-// ***** WebSocket-Event-Handler *****
-void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client,
-               AwsEventType type, void * arg, uint8_t *data, size_t len) {
-  if (type == WS_EVT_CONNECT) {
-    Serial.printf("WebSocket client #%u connected\n", client->id());
-    String json = "{";
-    json += "\"schwarzeTaste\":";
-    json += (digitalRead(schwarzeTastePin) == LOW ? "true" : "false");
-    json += ",\"gabel\":";
-    json += (digitalRead(gabelPin) == LOW ? "false" : "true");
-    json += ",\"klingelAktiv\":";
-    json += (klingelAktiv ? "true" : "false");
-    json += "}";
-    client->text(json);
-  } else if (type == WS_EVT_DISCONNECT) {
-    Serial.printf("WebSocket client #%u disconnected\n", client->id());
-  } else if (type == WS_EVT_DATA) {
-    String msg = "";
-    for (size_t i = 0; i < len; i++) {
-      msg += (char)data[i];
-    }
-    Serial.printf("Received WS message: %s\n", msg.c_str());
-    if (msg.indexOf("klingelAktiv") >= 0) {
-      if (msg.indexOf("true") >= 0) {
-        klingelAktiv = true;
-      } else if (msg.indexOf("false") >= 0) {
-        klingelAktiv = false;
-      }
-      String json = "{ \"klingelAktiv\": " + String(klingelAktiv ? "true" : "false") + " }";
-      ws.textAll(json);
-    }
-  }
-}
-
-// ***** Funktion: Sendet den Status der Tasten per WebSocket *****
-void notifyClients() {
-  String json = "{";
-  json += "\"schwarzeTaste\":";
-  json += (digitalRead(schwarzeTastePin) == LOW ? "true" : "false");
-  json += ",\"gabel\":";
-  json += (digitalRead(gabelPin) == LOW ? "false" : "true");
-  json += ",\"klingelAktiv\":";
-  json += (klingelAktiv ? "true" : "false");
-  json += "}";
-  ws.textAll(json);
-}
-
-// ***** WiFi-Konfigurationsmodus: AP-Modus, falls Konfigurationstaste beim Powerup gedrückt *****
+// ***** Konfigurationsmodus (AP + Webinterface) *****
 void startConfigMode() {
   Serial.println("Entering configuration mode...");
   WiFi.mode(WIFI_AP);
@@ -307,108 +228,283 @@ void startConfigMode() {
   }
 }
 
+
+
+// ***** Interrupt-Service-Routine für die Wählscheibe (Entprellung) *****
+void IRAM_ATTR dialISR() {
+  static unsigned long lastDebounceTime = 0;
+  unsigned long now = millis();
+  if (now - lastDebounceTime > 75) {
+    pulseCount++;
+    lastPulseTime = now;
+    lastDebounceTime = now;
+  }
+}
+
+// ***** Hintergrundtask: Erzeugt Klingelimpulse bei aktivem Klingelmodus *****
+void pulseTask(void * parameter) {
+  for (;;) {
+    if (klingelAktiv && klingel_not_paused) {
+      
+      digitalWrite(in1Pin_h_bridge, HIGH);
+      digitalWrite(in2Pin_h_bridge, LOW);
+
+      vTaskDelay(pdMS_TO_TICKS(10));
+      digitalWrite(in1Pin_h_bridge, LOW);
+      vTaskDelay(pdMS_TO_TICKS(5));
+      digitalWrite(in2Pin_h_bridge, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(10));
+      digitalWrite(in2Pin_h_bridge, LOW);
+      vTaskDelay(pdMS_TO_TICKS(5));
+    } else {
+      digitalWrite(in1Pin_h_bridge, LOW);
+      digitalWrite(in2Pin_h_bridge, LOW);
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+}
+
+
+
+// ***** Task zur Auswertung der Wählscheibe und URL-Aufrufe *****
+void dialTask(void * parameter) {
+  for (;;) {
+    unsigned long now = millis();
+    if (pulseCount > 0 && (now - lastPulseTime > 200)) {
+      noInterrupts();
+      int count = pulseCount;
+      pulseCount = 0;
+      interrupts();
+      int digit = (count == 10) ? 0 : count;
+      dialNumber += String(digit);
+      Serial.printf("Digit added: %d\n", digit);
+    }
+    if (pulseCount == 0 && dialNumber.length() > 0 && (now - lastPulseTime > 3000)) {
+      // Nummer gesamt senden
+      ws.textAll(String("{ \"dialNumber\": \"") + dialNumber + "\" }");
+      // passende URL auswählen oder unbekannt
+      String callURL = urlUnknownNumber;
+      int idx = dialNumber.toInt();
+      if (millis() < 30*1000) {
+        if (dialNumber == "1234")
+          startConfigMode();
+      }
+      sendURL(urlOnDialed);
+      for (int i = 1; i <= 5; i++) {
+        if (dialNumber == mapKey[i]) {
+          callURL = mapURL[i];
+          break;
+        }
+      }
+      if(currentGabel == GABEL_ABGENOMMEN)
+        sendURL(callURL);
+      Serial.printf("Called URL for number %s: %s\n", dialNumber.c_str(), callURL.c_str());
+      dialNumber = "";
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ***** WebSocket-Event-Handler *****
+void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client,
+               AwsEventType type, void * arg, uint8_t * data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("WebSocket client #%u connected\n", client->id());
+    String json = "{";
+    json += "\"schwarzeTaste\":" + String(digitalRead(schwarzeTastePin)==LOW?"true":"false");
+    json += ",\"gabel\":" + String(digitalRead(gabelPin)==LOW?"true":"false");
+    json += ",\"klingelAktiv\":" + String(klingelAktiv?"true":"false");
+    json += "}";
+    client->text(json);
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("WebSocket client #%u disconnected\n", client->id());
+  } else if (type == WS_EVT_DATA) {
+    String msg;
+    for (size_t i = 0; i < len; i++) msg += (char)data[i];
+    Serial.printf("Received WS message: %s\n", msg.c_str());
+    if (msg.indexOf("klingelAktiv") >= 0) {
+      klingelAktiv = (msg.indexOf("true") >= 0);
+      String resp = String("{ \"klingelAktiv\": ") + (klingelAktiv?"true":"false") + " }";
+      ws.textAll(resp);
+      // Klingel-URLs aufrufen
+      sendURL(klingelAktiv ? urlBellOn : urlBellOff);
+    }
+  }
+}
+
+// ***** Status an alle WebSocket-Clients senden *****
+void notifyClients() {
+  String json = "{";
+  json += "\"schwarzeTaste\":" + String(digitalRead(schwarzeTastePin)==LOW?"true":"false");
+  json += ",\"gabel\":" + String(digitalRead(gabelPin)==LOW?"true":"false");
+  json += ",\"klingelAktiv\":" + String(klingelAktiv?"true":"false");
+  json += "}";
+  ws.textAll(json);
+}
+
 void setup() {
   Serial.begin(115200);
-  
-  // ***** Pin-Konfiguration *****
+  // Pin-Setup
   pinMode(in1Pin_h_bridge, OUTPUT);
   pinMode(in2Pin_h_bridge, OUTPUT);
-  digitalWrite(in1Pin_h_bridge, LOW);
-  digitalWrite(in2Pin_h_bridge, LOW);
-  
   pinMode(dialPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(dialPin), dialISR, FALLING);
-  
   pinMode(schwarzeTastePin, INPUT_PULLUP);
   pinMode(gabelPin, INPUT_PULLUP);
   pinMode(resetPin, INPUT_PULLUP);
 
-  // ***** Prüfe, ob beim Powerup die Konfigurationstaste gedrückt ist *****
-  delay(500);
+  // Config-Modus prüfen
+  delay(50);
   if (digitalRead(resetPin) == LOW) {
     startConfigMode();
   }
-  
-  // ***** Lade gespeicherte WLAN-Zugangsdaten (falls vorhanden) *****
-  Preferences preferences;
-  preferences.begin("wifi", true);
-  String storedSSID = preferences.getString("ssid", "");
-  String storedPassword = preferences.getString("password", "");
-  preferences.end();
-  if (storedSSID.length() > 0) {
-    wifiSSID = storedSSID;
-    wifiPassword = storedPassword;
-    Serial.println("Loaded stored WiFi credentials:");
-    Serial.println(wifiSSID);
-  } else {
-    Serial.println("Using default WiFi credentials.");
-  }
-  
-  // ***** WLAN-Verbindung im Client-Modus *****
+
+  // WLAN-Credentials laden
+  Preferences wifiPrefs;
+  wifiPrefs.begin("wifi", true);
+  wifiSSID = wifiPrefs.getString("ssid", "");
+  wifiPassword = wifiPrefs.getString("password", "");
+  wifiPrefs.end();
+
+  // WLAN verbinden
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+    delay(100);
+    Serial.print('.');
   }
   Serial.println();
   Serial.print("Connected. IP address: ");
   Serial.println(WiFi.localIP());
-  
-  // ***** OTA-Setup *****
-  ArduinoOTA.setHostname("ESP32_Telephone");
-  ArduinoOTA.onStart([]() {
-    Serial.println("OTA Update Start");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nOTA Update End");
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("OTA Progress: %u%%\n", (progress * 100) / total);
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("OTA Error[%u]: ", error);
-    if(error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if(error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if(error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if(error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if(error == OTA_END_ERROR) Serial.println("End Failed");
-  });
+
+  // URL-Konfiguration laden
+  Preferences cfg;
+  cfg.begin("config", true);
+  urlBellOn        = cfg.getString("urlBellOn", "");
+  urlBellOff       = cfg.getString("urlBellOff", "");
+  urlOffHook       = cfg.getString("urlOffHook", "");
+  urlOnHook        = cfg.getString("urlOnHook", "");
+  urlOnDialed      = cfg.getString("urlOnDialed", "");
+  urlUnknownNumber = cfg.getString("url_unknown", "");
+  urlBlackButton   = cfg.getString("urlBlackButton", "");
+  char keyBuf[16];
+  for (int i = 1; i <= 5; i++) {
+    snprintf(keyBuf, sizeof(keyBuf), "mapKey%d", i);
+    mapKey[i] = cfg.getString(keyBuf, "");
+    snprintf(keyBuf, sizeof(keyBuf), "mapURL%d", i);
+    mapURL[i] = cfg.getString(keyBuf, "");
+  }
+  cfg.end();
+
+  // OTA starten
   ArduinoOTA.begin();
-  
-  // ***** WebSocket und Webserver für das Telefoninterface einrichten *****
+
+  // WebSocket & Webserver
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", index_html);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest * req) {
+    String page = FPSTR(index_html);
+    // Platzhalter ersetzen
+    String fields;
+    for (int i = 1; i <= 5; i++) {
+      fields += String("<label>Nummer ") + i + ":</label>";
+      fields += String("<input type=\"text\" name=\"mapKey") + i +
+                String("\" value=\"") + mapKey[i] + String("\">");
+      fields += String("<label>URL Nummer ") + i + ":</label>";
+      fields += String("<input type=\"text\" name=\"mapURL") + i +
+                String("\" value=\"") + mapURL[i] + String("\">");
+    }
+    page.replace("%NUM_CONFIG_FIELDS%", fields);
+    page.replace("%URL_BELL_ON%", urlBellOn);
+    page.replace("%URL_BELL_OFF%", urlBellOff);
+    page.replace("%URL_OFF_HOOK%", urlOffHook);
+    page.replace("%URL_ON_HOOK%", urlOnHook);
+    page.replace("%URL_ON_DIALED%", urlOnDialed);
+    page.replace("%URL_UNKNOWN%", urlUnknownNumber);
+    page.replace("%URL_BLACK%", urlBlackButton);
+    req->send(200, "text/html", page);
+  });
+  server.on("/saveConfig", HTTP_POST, [](AsyncWebServerRequest * req) {
+    Serial.println("save config!");
+    Preferences prefs;
+    prefs.begin("config", false);
+    prefs.putString("urlBellOn", req->getParam("urlBellOn", true)->value());
+    prefs.putString("urlBellOff", req->getParam("urlBellOff", true)->value());
+    prefs.putString("urlOffHook", req->getParam("urlOffHook", true)->value());
+    prefs.putString("urlOnHook", req->getParam("urlOnHook", true)->value());
+    prefs.putString("urlOnDialed", req->getParam("urlOnDialed", true)->value());
+    prefs.putString("url_unknown", req->getParam("urlUnknownNumber", true)->value());
+    prefs.putString("urlBlackButton", req->getParam("urlBlackButton", true)->value());
+    char key[16];
+    for (int i = 1; i <= 5; i++) {
+      snprintf(key, sizeof(key), "mapKey%d", i);
+      prefs.putString(key, req->getParam(key, true)->value());
+      snprintf(key, sizeof(key), "mapURL%d", i);
+      prefs.putString(key, req->getParam(key, true)->value());
+    }
+    prefs.end();
+    Serial.println("save config done!");
+    req->send(200, "text/html", "<html><body><h1>Config saved. Restarting...</h1></body></html>");
+    delay(2000);
+    ESP.restart();
+  });
+  server.on("/url_after_hang_up", HTTP_ANY, [](AsyncWebServerRequest * req) {
+    Serial.println("aktivate URL call after hang up");
+    url_after_hang_up = true;
+    req->send(200, "text/html", "<html><body>URL call after hang up</body></html>");
+  });
+  server.on("/url_after_lift", HTTP_ANY, [](AsyncWebServerRequest * req) {
+    Serial.println("aktivate URL call after hang up");
+    url_after_lift = true;
+    req->send(200, "text/html", "<html><body>URL call after lift</body></html>");
+  });
+  server.on("/klingel_an", HTTP_ANY, [](AsyncWebServerRequest * req) {
+    Serial.println("url call klingel an");
+    klingelAktiv = true;
+    req->send(200, "text/html", "<html><body>klingel an</body></html>");
+  });
+  server.on("/klingel_aus", HTTP_ANY, [](AsyncWebServerRequest * req) {
+    Serial.println("url call klingel aus");
+    klingelAktiv = false;
+    req->send(200, "text/html", "<html><body>klingel aus</body></html>");
   });
   server.begin();
-  Serial.println("HTTP server started");
-  
-  // ***** Tasks starten *****
+
+  // Tasks starten
   xTaskCreatePinnedToCore(pulseTask, "PulseTask", 1024, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(dialTask, "DialTask", 2048, NULL, 1, NULL, 1);
 }
 
 void loop() {
   ArduinoOTA.handle();
-  
-  bool currentSchwarzeTasteState = (digitalRead(schwarzeTastePin) == LOW);
-  bool currentGabelState = (digitalRead(gabelPin) == LOW);
-  
-  static bool lastSchwarzeTasteState = currentSchwarzeTasteState;
-  static bool lastGabelState = currentGabelState;
-  
-  if (currentSchwarzeTasteState != lastSchwarzeTasteState || currentGabelState != lastGabelState) {
-    Serial.print("Schwarze Taste: ");
-    Serial.print(currentSchwarzeTasteState ? "Pressed" : "Released");
-    Serial.print(" | Gabel: ");
-    Serial.println(currentGabelState ? "Released" : "Pressed");
+
+  // Tasten-Status überwachen
+  bool currentSchwarz = (digitalRead(schwarzeTastePin) == LOW);
+  currentGabel  = (digitalRead(gabelPin) == LOW);
+  static bool lastSchwarz = currentSchwarz;
+  static bool lastGabel   = currentGabel;
+
+  if ((currentSchwarz != lastSchwarz) || (currentGabel != lastGabel)) {
     notifyClients();
-    lastSchwarzeTasteState = currentSchwarzeTasteState;
-    lastGabelState = currentGabelState;
+    if (currentSchwarz && !lastSchwarz) sendURL(urlBlackButton);
+    if (currentGabel != lastGabel) {
+      if (klingelAktiv && currentGabel == GABEL_ABGENOMMEN)
+        klingelAktiv = false;
+      if((currentGabel == GABEL_ABGENOMMEN) && url_after_lift){
+        url_after_lift = false;
+        sendURL(urlOffHook);
+      } 
+      if((currentGabel  == GABEL_AUFGELEGT) && url_after_hang_up ){
+          url_after_hang_up = false;
+          sendURL(urlOnHook);
+      }
+    }
+    lastSchwarz = currentSchwarz;
+    lastGabel   = currentGabel;
   }
-  
+
   delay(50);
+
+  klingel_not_paused = (millis()/1000)%2 != 0;
 }
