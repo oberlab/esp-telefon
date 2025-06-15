@@ -12,17 +12,19 @@ String wifiPassword;
 // ***** Configurable URLs and number mappings *****
 String urlBellOn;
 String urlBellOff;
-String urlOffHook;
+String urlOHookRing;
+String urlOHookNoRing;
 String urlOnHook;
+String urlDialStarted;
 String urlOnDialed;
 String urlUnknownNumber;
 String urlBlackButton;
-String mapKey[6];       // 1-based: configured dial strings
-String mapURL[6];       // corresponding URLs
+String mapKey[10];       // 1-based: configured dial strings
+String mapURL[10];       // corresponding URLs
 
 // ***** Pin-Konfiguration *****
-const int in1Pin_h_bridge = 32;   // IN1 des L298N
-const int in2Pin_h_bridge = 33;   // IN2 des L298N
+const int in1Pin_h_bridge  = 32;  // IN1 des L298N
+const int in2Pin_h_bridge  = 33;  // IN2 des L298N
 const int dialPin          = 12;  // Wählscheibe Eingang (mit internem Pullup)
 const int schwarzeTastePin = 14;  // "Schwarze Taste" (active LOW)
 const int gabelPin         = 27;  // "Gabel" – normally closed (invertierte Logik)
@@ -31,12 +33,13 @@ const int resetPin         = 25;  // "Reset" – Config-Taste beim Powerup
 // ***** Variablen für Wählscheibe & Klingel *****
 volatile int pulseCount = 0;              // Zählt Impulse der Wählscheibe
 volatile unsigned long lastPulseTime = 0; // Zeitpunkt des letzten Impulses
-String dialNumber = "";                  // Sammelt gewählte Ziffern
+String dialNumber = "";                   // Sammelt gewählte Ziffern
 volatile bool klingelAktiv = false;       // Klingel-Modus steuern
 volatile bool klingel_not_paused = false;
 volatile bool url_after_lift = false;
 volatile bool url_after_hang_up = false;
 bool currentGabel = LOW;
+bool numberDialInProgress = false;        // wird true, wenn eine nummer gewählt wird
 
 #define GABEL_ABGENOMMEN HIGH
 #define GABEL_AUFGELEGT LOW
@@ -101,10 +104,14 @@ const char index_html[] PROGMEM = R"rawliteral(
         <input type="text" name="urlBellOn" value="%URL_BELL_ON%">
         <label>URL Klingel deaktivieren:</label>
         <input type="text" name="urlBellOff" value="%URL_BELL_OFF%">
-        <label>URL Hörer abgehoben:</label>
-        <input type="text" name="urlOffHook" value="%URL_OFF_HOOK%">
+        <label>URL Hörer abgehoben bei Klingeln:</label>
+        <input type="text" name="urlOHookRing" value="%URL_OFF_HOOK_RING%">
+        <label>URL Hörer abgehoben ohne Klingeln:</label>
+        <input type="text" name="urlOHookNoRing" value="%URL_OFF_HOOK_NO_RING%">
         <label>URL Hörer aufgelegt:</label>
         <input type="text" name="urlOnHook" value="%URL_ON_HOOK%">
+        <label>URL Anfang wahl:</label>
+        <input type="text" name="urlDialStarted" value="%URL_NUMBER_DIAL_STARTED%">
         <label>URL gewählt:</label>
         <input type="text" name="urlOnDialed" value="%URL_ON_DIALED%">
         <label>URL unbekannte Nummer:</label>
@@ -197,10 +204,12 @@ const char config_html[] PROGMEM = R"rawliteral(
 void startConfigMode() {
   Serial.println("Entering configuration mode...");
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32_Config");
+  WiFi.softAP("Oberlab_Telefon");
+  
   server.on("/", HTTP_GET, [] (AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", config_html);
   });
+
   server.on("/save", HTTP_POST, [] (AsyncWebServerRequest *request) {
     String newSSID = "";
     String newPassword = "";
@@ -235,6 +244,7 @@ void IRAM_ATTR dialISR() {
   static unsigned long lastDebounceTime = 0;
   unsigned long now = millis();
   if (now - lastDebounceTime > 75) {
+    numberDialInProgress = true;
     pulseCount++;
     lastPulseTime = now;
     lastDebounceTime = now;
@@ -279,7 +289,10 @@ void dialTask(void * parameter) {
       dialNumber += String(digit);
       Serial.printf("Digit added: %d\n", digit);
     }
+
+    // zuende gewählt, nach 3 Sekunden Stillstand
     if (pulseCount == 0 && dialNumber.length() > 0 && (now - lastPulseTime > 3000)) {
+      numberDialInProgress = false;
       // Nummer gesamt senden
       ws.textAll(String("{ \"dialNumber\": \"") + dialNumber + "\" }");
       // passende URL auswählen oder unbekannt
@@ -369,7 +382,8 @@ void setup() {
   // WLAN verbinden
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-  Serial.print("Connecting to WiFi");
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(wifiSSID);
   while (WiFi.status() != WL_CONNECTED) {
     delay(100);
     Serial.print('.');
@@ -381,13 +395,15 @@ void setup() {
   // URL-Konfiguration laden
   Preferences cfg;
   cfg.begin("config", true);
-  urlBellOn        = cfg.getString("urlBellOn", "");
-  urlBellOff       = cfg.getString("urlBellOff", "");
-  urlOffHook       = cfg.getString("urlOffHook", "");
-  urlOnHook        = cfg.getString("urlOnHook", "");
-  urlOnDialed      = cfg.getString("urlOnDialed", "");
-  urlUnknownNumber = cfg.getString("url_unknown", "");
-  urlBlackButton   = cfg.getString("urlBlackButton", "");
+  urlBellOn            = cfg.getString("urlBellOn", "");
+  urlBellOff           = cfg.getString("urlBellOff", "");
+  urlOHookRing         = cfg.getString("urlOHookRing", "");
+  urlOHookNoRing       = cfg.getString("urlOHookNoRing", "");
+  urlOnHook            = cfg.getString("urlOnHook", "");
+  urlDialStarted       = cfg.getString("urlDialStarted", "");
+  urlOnDialed          = cfg.getString("urlOnDialed", "");
+  urlUnknownNumber     = cfg.getString("url_unknown", "");
+  urlBlackButton       = cfg.getString("urlBlackButton", "");
   char keyBuf[16];
   for (int i = 1; i <= 5; i++) {
     snprintf(keyBuf, sizeof(keyBuf), "mapKey%d", i);
@@ -405,6 +421,7 @@ void setup() {
   server.addHandler(&ws);
   server.on("/", HTTP_GET, [](AsyncWebServerRequest * req) {
     String page = FPSTR(index_html);
+
     // Platzhalter ersetzen
     String fields;
     for (int i = 1; i <= 5; i++) {
@@ -418,21 +435,28 @@ void setup() {
     page.replace("%NUM_CONFIG_FIELDS%", fields);
     page.replace("%URL_BELL_ON%", urlBellOn);
     page.replace("%URL_BELL_OFF%", urlBellOff);
-    page.replace("%URL_OFF_HOOK%", urlOffHook);
+    page.replace("%URL_OFF_HOOK_RING%", urlOHookRing);
+    page.replace("%URL_OFF_HOOK_NO_RING%", urlOHookNoRing);
     page.replace("%URL_ON_HOOK%", urlOnHook);
+    page.replace("%URL_NUMBER_DIAL_STARTED%", urlDialStarted);
     page.replace("%URL_ON_DIALED%", urlOnDialed);
     page.replace("%URL_UNKNOWN%", urlUnknownNumber);
     page.replace("%URL_BLACK%", urlBlackButton);
     req->send(200, "text/html", page);
   });
+
+
   server.on("/saveConfig", HTTP_POST, [](AsyncWebServerRequest * req) {
+    req->send(200, "text/html", "<html><body><h1>Saving Config. Restarting...</h1></body></html>");
     Serial.println("save config!");
     Preferences prefs;
     prefs.begin("config", false);
     prefs.putString("urlBellOn", req->getParam("urlBellOn", true)->value());
     prefs.putString("urlBellOff", req->getParam("urlBellOff", true)->value());
-    prefs.putString("urlOffHook", req->getParam("urlOffHook", true)->value());
+    prefs.putString("urlOHookRing", req->getParam("urlOHookRing", true)->value());
+    prefs.putString("urlOHookNoRing", req->getParam("urlOHookNoRing", true)->value());
     prefs.putString("urlOnHook", req->getParam("urlOnHook", true)->value());
+    prefs.putString("urlDialStarted", req->getParam("urlDialStarted", true)->value());
     prefs.putString("urlOnDialed", req->getParam("urlOnDialed", true)->value());
     prefs.putString("url_unknown", req->getParam("urlUnknownNumber", true)->value());
     prefs.putString("urlBlackButton", req->getParam("urlBlackButton", true)->value());
@@ -446,29 +470,34 @@ void setup() {
     prefs.end();
     Serial.println("save config done!");
     req->send(200, "text/html", "<html><body><h1>Config saved. Restarting...</h1></body></html>");
-    delay(2000);
+    delay(20000);
     ESP.restart();
   });
+
   server.on("/url_after_hang_up", HTTP_ANY, [](AsyncWebServerRequest * req) {
     Serial.println("aktivate URL call after hang up");
     url_after_hang_up = true;
     req->send(200, "text/html", "<html><body>URL call after hang up</body></html>");
   });
+
   server.on("/url_after_lift", HTTP_ANY, [](AsyncWebServerRequest * req) {
     Serial.println("aktivate URL call after hang up");
     url_after_lift = true;
     req->send(200, "text/html", "<html><body>URL call after lift</body></html>");
   });
+
   server.on("/klingel_an", HTTP_ANY, [](AsyncWebServerRequest * req) {
     Serial.println("url call klingel an");
     klingelAktiv = true;
     req->send(200, "text/html", "<html><body>klingel an</body></html>");
   });
+
   server.on("/klingel_aus", HTTP_ANY, [](AsyncWebServerRequest * req) {
     Serial.println("url call klingel aus");
     klingelAktiv = false;
     req->send(200, "text/html", "<html><body>klingel aus</body></html>");
   });
+
   server.begin();
 
   // Tasks starten
@@ -484,17 +513,34 @@ void loop() {
   currentGabel  = (digitalRead(gabelPin) == LOW);
   static bool lastSchwarz = currentSchwarz;
   static bool lastGabel   = currentGabel;
+  static bool lastnumberDialInProgress = numberDialInProgress;
 
+  // did the user do anything (press black button or pick up the receiver)
   if ((currentSchwarz != lastSchwarz) || (currentGabel != lastGabel)) {
     notifyClients();
+    
+    // Schwarze Taste gedrückt oder losgelassen
     if (currentSchwarz && !lastSchwarz) sendURL(urlBlackButton);
+
+    // Gabel aufgenommen oder aufgelegt
     if (currentGabel != lastGabel) {
+
+      // Es hat geklingelt und die Gabel wurde abgenommen = Ein Anruf kommt rein
       if (klingelAktiv && currentGabel == GABEL_ABGENOMMEN)
         klingelAktiv = false;
-      if((currentGabel == GABEL_ABGENOMMEN) && url_after_lift){
-        url_after_lift = false;
-        sendURL(urlOffHook);
-      } 
+        sendURL(urlOHookRing);
+
+      // Es hat nicht geklingelt und die Gabel wurde abgenommen = Es soll ein Anruf gemacht werden
+      if (!klingelAktiv && currentGabel == GABEL_ABGENOMMEN)
+        klingelAktiv = false;
+        sendURL(urlOHookNoRing);
+
+      // Legacy mode, Url senden wenn freigeschatet
+      //if((currentGabel == GABEL_ABGENOMMEN) && url_after_lift){
+      //  url_after_lift = false;
+      //  sendURL(urlOffHook);
+      //} 
+
       if((currentGabel  == GABEL_AUFGELEGT) && url_after_hang_up ){
           url_after_hang_up = false;
           sendURL(urlOnHook);
@@ -504,6 +550,12 @@ void loop() {
     lastGabel   = currentGabel;
   }
 
+  // Ist der Hörer aufgenommen und wird angefangen zu wählen?
+  if((currentGabel == GABEL_ABGENOMMEN) && numberDialInProgress == true && lastnumberDialInProgress == false){
+    sendURL(urlDialStarted);
+  }
+  lastnumberDialInProgress = numberDialInProgress;
+  
   delay(50);
 
   klingel_not_paused = (millis()/1000)%2 != 0;
